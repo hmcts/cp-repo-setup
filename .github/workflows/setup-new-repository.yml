@@ -1,0 +1,137 @@
+name: Initial Repository Setup (One-Time Setup)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Target repository in the format org/repo-name'
+        required: true
+
+jobs:
+  configure-repo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Parse inputs
+        id: parse
+        run: |
+          echo "REPO=${{ github.event.inputs.repo }}" >> $GITHUB_ENV
+
+      - name: Enable auto-delete merged branches
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SETUP_TOKEN }}
+        run: |
+          echo "Enabling delete_branch_on_merge for $REPO"
+          gh api \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            /repos/$REPO \
+            -f delete_branch_on_merge=true
+
+      - name: Enable private vulnerability reporting
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SETUP_TOKEN }}
+        run: |
+          echo "Enabling private vulnerability reporting for $REPO"
+          gh api \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            /repos/$REPO \
+            -f security_and_analysis.private_vulnerability_reporting.enabled=true
+
+      - name: Enable secret scanning and push protection
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SETUP_TOKEN }}
+        run: |
+          echo "Enabling secret scanning and push protection for $REPO"
+          gh api \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            /repos/$REPO \
+            -f security_and_analysis.secret_scanning.enabled=true \
+            -f security_and_analysis.secret_scanning_push_protection.enabled=true
+
+      - name: Enable Dependabot and grouped updates
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SETUP_TOKEN }}
+        run: |
+          echo "Enabling Dependabot updates for GitHub Actions in $REPO"
+          gh api \
+            -X PUT \
+            -H "Accept: application/vnd.github+json" \
+            /repos/$REPO/dependabot/updates \
+            -f updates='[
+              {
+                "package-ecosystem": "github-actions",
+                "directory": "/",
+                "schedule": {"interval": "weekly"},
+                "groups": {
+                  "actions": {
+                    "patterns": ["*"],
+                    "update-types": ["security", "version-update:semver-major"]
+                  }
+                }
+              }
+            ]'
+
+          echo "Enabling Dependabot security updates"
+          gh api \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            /repos/$REPO \
+            -f security_and_analysis.dependabot_security_updates.enabled=true
+
+      - name: List rulesets in target repository
+        id: ruleset_check
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SETUP_TOKEN }}
+        run: |
+          echo "Checking for .github/rulesets/ directory in $REPO..."
+          curl -s -H "Authorization: token $GH_TOKEN" \
+            https://api.github.com/repos/$REPO/contents/.github/rulesets \
+            -o ruleset_list.json
+
+          FILE_COUNT=$(jq length ruleset_list.json)
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "No ruleset files found. Skipping ruleset application."
+            echo "apply_ruleset=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$FILE_COUNT ruleset file(s) found."
+            echo "apply_ruleset=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and apply all rulesets
+        if: steps.ruleset_check.outputs.apply_ruleset == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SETUP_TOKEN }}
+        run: |
+          echo "Downloading and applying rulesets from $REPO..."
+
+          # Download ruleset list again
+          curl -s -H "Authorization: token $GH_TOKEN" \
+            https://api.github.com/repos/$REPO/contents/.github/rulesets \
+            -o ruleset_list.json
+
+          # Iterate through each .json file
+          jq -r '.[] | select(.name | endswith(".json")) | .name' ruleset_list.json | while read filename; do
+            echo "Processing ruleset: $filename"
+
+            # Download the raw JSON file
+            curl -s -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.raw+json" \
+              https://api.github.com/repos/$REPO/contents/.github/rulesets/$filename \
+              -o tmp_ruleset.json
+
+            # Inject the correct source
+            jq --arg repo "$REPO" '.source = $repo' tmp_ruleset.json > final_ruleset.json
+
+            # Apply the ruleset
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              /repos/$REPO/rulesets \
+              --input final_ruleset.json
+
+            echo "✅ Applied $filename"
+          done
